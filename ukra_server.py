@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import hmac
 import socket
 import sqlite3
 import threading
@@ -22,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 NICK_RE = re.compile(r"^[a-z0-9_.]{3,20}$")
 MAX_IMAGE = 800 * 1024
-MAX_JSON = 24 * 1024
+MAX_JSON = 160 * 1024
 MAX_TEXT = 8000  # зашифроване повідомлення довше за відкритий текст
 RATE_LIMIT = 30  # повідомлень на хвилину з одного акаунта
 REGISTER_LIMIT = 10  # нових акаунтів на годину з однієї адреси
@@ -42,6 +43,9 @@ def init_db(path):
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nick TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL DEFAULT '',
+            pass_salt TEXT NOT NULL DEFAULT '',
+            pass_hash TEXT NOT NULL DEFAULT '',
             token_hash TEXT NOT NULL,
             name TEXT DEFAULT '', name_lc TEXT DEFAULT '', uid INTEGER, pub TEXT DEFAULT '', bio TEXT DEFAULT '',
             city TEXT DEFAULT '', oblast TEXT DEFAULT '', locality_id TEXT DEFAULT '',
@@ -55,6 +59,39 @@ def init_db(path):
         );
         CREATE INDEX IF NOT EXISTS idx_msg_to ON messages(to_id, id);
         CREATE INDEX IF NOT EXISTS idx_msg_from ON messages(from_id, id);
+
+        CREATE TABLE IF NOT EXISTS message_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            direct_message_id INTEGER UNIQUE,
+            group_message_id INTEGER UNIQUE
+        );
+        INSERT OR IGNORE INTO message_events (id, direct_message_id)
+            SELECT id, id FROM messages ORDER BY id;
+
+        CREATE TABLE IF NOT EXISTS chat_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            invite_code TEXT UNIQUE NOT NULL,
+            owner_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS group_members (
+            group_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'member',
+            joined_at INTEGER NOT NULL,
+            PRIMARY KEY (group_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id, group_id);
+        CREATE TABLE IF NOT EXISTS group_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            from_id INTEGER NOT NULL,
+            ciphertexts TEXT NOT NULL,
+            ts INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id, id);
 
         CREATE TABLE IF NOT EXISTS market_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,6 +117,43 @@ def init_db(path):
         CREATE INDEX IF NOT EXISTS idx_market_loc ON market_items(locality_id, status);
         CREATE INDEX IF NOT EXISTS idx_market_city ON market_items(city, status);
         CREATE INDEX IF NOT EXISTS idx_market_user ON market_items(user_id, status);
+
+        CREATE TABLE IF NOT EXISTS missions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            author_nick TEXT NOT NULL,
+            author_name TEXT NOT NULL,
+            locality_id TEXT NOT NULL,
+            city TEXT NOT NULL,
+            oblast TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL,
+            district TEXT NOT NULL DEFAULT '',
+            schedule TEXT NOT NULL DEFAULT '',
+            target INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'Шукаємо учасників',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_missions_locality_status ON missions(locality_id, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_missions_user ON missions(user_id, status);
+        CREATE TABLE IF NOT EXISTS mission_participants (
+            mission_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            joined_at INTEGER NOT NULL,
+            PRIMARY KEY (mission_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mission_participants_user ON mission_participants(user_id, mission_id);
+        CREATE TABLE IF NOT EXISTS mission_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reporter_id INTEGER NOT NULL,
+            mission_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            details TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mission_reports_mission ON mission_reports(mission_id, created_at);
 
         CREATE TABLE IF NOT EXISTS market_favorites (
             user_id INTEGER NOT NULL,
@@ -132,6 +206,13 @@ def init_db(path):
         );
         """
     )
+    # Migrate existing MVP databases without discarding existing nick accounts.
+    cols = {r[1] for r in DB.execute("PRAGMA table_info(users)").fetchall()}
+    for name, sql in (("email", "ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''"), ("pass_salt", "ALTER TABLE users ADD COLUMN pass_salt TEXT NOT NULL DEFAULT ''"), ("pass_hash", "ALTER TABLE users ADD COLUMN pass_hash TEXT NOT NULL DEFAULT ''")):
+        if name not in cols:
+            DB.execute(sql)
+    DB.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email != ''")
+    DB.commit()
     for column in ("name_lc TEXT DEFAULT ''", "uid INTEGER", "pub TEXT DEFAULT ''"):
         try:
             DB.execute("ALTER TABLE users ADD COLUMN " + column)
@@ -291,6 +372,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.search(query.get("q", [""])[0])
         if parts == ["api", "messages"]:
             return self.get_messages(query.get("since", ["0"])[0])
+        if parts == ["api", "missions"]:
+            return self.get_missions(query)
+        if parts == ["api", "groups"]:
+            return self.list_groups()
+        if len(parts) == 3 and parts[:2] == ["api", "groups"]:
+            return self.get_group(parts[2])
         # UKRA Market GET routes
         if parts == ["api", "market", "items"]:
             return self.get_market_items(query)
@@ -312,12 +399,38 @@ class Handler(BaseHTTPRequestHandler):
         parts = [unquote(p) for p in urlparse(self.path).path.strip("/").split("/")]
         if parts == ["api", "register"]:
             return self.register()
+        if parts == ["api", "login"]:
+            return self.login()
         if parts == ["api", "profile"]:
             return self.update_profile()
         if len(parts) == 2 and parts[0] == "api" and parts[1] in ("avatar", "cover"):
             return self.upload_image(parts[1])
         if parts == ["api", "send"]:
             return self.send_message()
+        if parts == ["api", "missions"]:
+            return self.create_mission()
+        if len(parts) == 4 and parts[:2] == ["api", "missions"]:
+            if parts[3] == "join":
+                return self.join_mission(parts[2])
+            if parts[3] == "status":
+                return self.update_mission_status(parts[2])
+            if parts[3] == "report":
+                return self.report_mission(parts[2])
+        if parts == ["api", "groups"]:
+            return self.create_group()
+        if parts == ["api", "groups", "join"]:
+            return self.join_group()
+        if len(parts) == 4 and parts[:2] == ["api", "groups"]:
+            actions = {
+                "members": self.add_group_member,
+                "role": self.set_group_member_role,
+                "remove": self.remove_group_member,
+                "leave": self.leave_group,
+                "update": self.update_group,
+                "messages": self.send_group_message,
+            }
+            if parts[3] in actions:
+                return actions[parts[3]](parts[2])
         # UKRA Market POST routes
         if parts == ["api", "market", "items"]:
             return self.create_market_item()
@@ -364,23 +477,51 @@ class Handler(BaseHTTPRequestHandler):
         nick = clean(data.get("nick"), 40).lstrip("@").lower()
         if not NICK_RE.match(nick) or nick.startswith(".") or nick.endswith(".") or nick.isdigit():
             return self.fail(400, "Нікнейм: 3–20 символів, лише a–z, 0–9, _ та крапка, і не лише з цифр")
+        email = clean(data.get("email"), 254).strip().lower()
+        password = str(data.get("password", ""))
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            return self.fail(400, "Вкажи коректну електронну пошту")
+        if len(password) < 12 or len(password) > 256:
+            return self.fail(400, "Пароль має містити від 12 до 256 символів")
+        salt = secrets.token_bytes(16)
+        password_hash = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1).hex()
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode()).hexdigest()
         try:
             with db_lock:
                 DB.execute(
-                    "INSERT INTO users (nick, token_hash, name, name_lc, uid, pub, bio, city, oblast, locality_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (nick, digest, clean(data.get("name"), 40), clean(data.get("name"), 40).lower(), new_uid(),
+                    "INSERT INTO users (nick, email, pass_salt, pass_hash, token_hash, name, name_lc, uid, pub, bio, city, oblast, locality_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (nick, email, salt.hex(), password_hash, digest, clean(data.get("name"), 40), clean(data.get("name"), 40).lower(), new_uid(),
                      valid_pub(data.get("pub")), clean(data.get("bio"), 200), clean(data.get("city"), 60),
                      clean(data.get("oblast"), 60), clean(data.get("locality_id"), 40), int(time.time())),
                 )
                 DB.commit()
                 row = DB.execute("SELECT * FROM users WHERE nick = ?", (nick,)).fetchone()
         except sqlite3.IntegrityError:
-            return self.fail(409, "Цей нікнейм уже зайнятий")
+            return self.fail(409, "Цей нікнейм або email уже використовується")
         recent.append(now)
         reg_rate[ip] = recent
         self.send_json(201, {"token": token, "user": public_user(row)})
+
+    def login(self):
+        data = self.read_json()
+        if data is None:
+            return
+        email = clean(data.get("email"), 254).strip().lower()
+        password = str(data.get("password", ""))
+        with db_lock:
+            row = DB.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        if row is None or not row["pass_salt"] or not row["pass_hash"]:
+            return self.fail(401, "Email або пароль неправильні")
+        actual = hashlib.scrypt(password.encode(), salt=bytes.fromhex(row["pass_salt"]), n=2**14, r=8, p=1).hex()
+        if not hmac.compare_digest(actual, row["pass_hash"]):
+            return self.fail(401, "Email або пароль неправильні")
+        token = secrets.token_urlsafe(32)
+        with db_lock:
+            DB.execute("UPDATE users SET token_hash = ? WHERE id = ?", (hashlib.sha256(token.encode()).hexdigest(), row["id"]))
+            DB.commit()
+            row = DB.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone()
+        self.send_json(200, {"token": token, "user": public_user(row)})
 
     def update_profile(self):
         user = self.require_auth()
@@ -480,8 +621,11 @@ class Handler(BaseHTTPRequestHandler):
                 "INSERT INTO messages (from_id, to_id, text, ts) VALUES (?,?,?,?)",
                 (user["id"], target["id"], text, int(now)),
             )
+            event = DB.execute(
+                "INSERT INTO message_events (direct_message_id) VALUES (?)", (cur.lastrowid,)
+            )
             DB.commit()
-            msg_id = cur.lastrowid
+            msg_id = event.lastrowid
         self.send_json(201, {"id": msg_id, "ts": int(now)})
 
     def get_messages(self, since_raw):
@@ -493,17 +637,440 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             since = 0
         with db_lock:
-            rows = DB.execute(
-                """SELECT m.id, m.text, m.ts, f.nick AS from_nick, t.nick AS to_nick
-                   FROM messages m JOIN users f ON f.id = m.from_id JOIN users t ON t.id = m.to_id
-                   WHERE (m.to_id = ? OR m.from_id = ?) AND m.id > ? ORDER BY m.id LIMIT 200""",
+            direct_rows = DB.execute(
+                """SELECT e.id AS event_id, m.text, m.ts, f.nick AS from_nick, t.nick AS to_nick
+                   FROM message_events e JOIN messages m ON m.id = e.direct_message_id
+                   JOIN users f ON f.id = m.from_id JOIN users t ON t.id = m.to_id
+                   WHERE (m.to_id = ? OR m.from_id = ?) AND e.id > ? ORDER BY e.id LIMIT 200""",
                 (user["id"], user["id"], since),
             ).fetchall()
-        self.send_json(200, {"messages": [
-            {"id": r["id"], "from": r["from_nick"], "to": r["to_nick"], "text": r["text"], "ts": r["ts"]} for r in rows
-        ]})
+            group_rows = DB.execute(
+                """SELECT e.id AS event_id, gm.group_id, gm.ciphertexts, gm.ts, u.nick AS from_nick
+                   FROM message_events e JOIN group_messages gm ON gm.id = e.group_message_id
+                   JOIN users u ON u.id = gm.from_id
+                   JOIN group_members mine ON mine.group_id = gm.group_id AND mine.user_id = ?
+                   WHERE e.id > ? ORDER BY e.id LIMIT 200""",
+                (user["id"], since),
+            ).fetchall()
+        messages = [
+            {"id": r["event_id"], "type": "direct", "from": r["from_nick"], "to": r["to_nick"], "text": r["text"], "ts": r["ts"]}
+            for r in direct_rows
+        ]
+        for row in group_rows:
+            try:
+                envelopes = json.loads(row["ciphertexts"])
+            except (ValueError, TypeError):
+                continue
+            cipher = envelopes.get(user["nick"])
+            if not isinstance(cipher, str):
+                continue
+            messages.append({
+                "id": row["event_id"], "type": "group", "group_id": row["group_id"],
+                "from": row["from_nick"], "text": cipher, "ts": row["ts"],
+            })
+        messages.sort(key=lambda item: item["id"])
+        self.send_json(200, {"messages": messages[:200]})
+
+    def _group_payload(self, group_id, user_id):
+        group = DB.execute(
+            """SELECT g.*, owner.nick AS owner_nick
+               FROM chat_groups g JOIN users owner ON owner.id = g.owner_id WHERE g.id = ?""",
+            (group_id,),
+        ).fetchone()
+        if group is None:
+            return None
+        mine = DB.execute(
+            "SELECT role FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, user_id)
+        ).fetchone()
+        if mine is None:
+            return None
+        members = DB.execute(
+            """SELECT u.nick, u.name, u.pub, gm.role, gm.joined_at
+               FROM group_members gm JOIN users u ON u.id = gm.user_id
+               WHERE gm.group_id = ? ORDER BY CASE gm.role WHEN 'owner' THEN 0 WHEN 'moderator' THEN 1 ELSE 2 END, u.nick""",
+            (group_id,),
+        ).fetchall()
+        return {
+            "id": group["id"], "name": group["name"], "description": group["description"],
+            "invite_code": group["invite_code"], "owner": group["owner_nick"],
+            "created_at": group["created_at"], "my_role": mine["role"],
+            "member_count": len(members),
+            "members": [{"nick": m["nick"], "name": m["name"], "pub": m["pub"], "role": m["role"], "joined_at": m["joined_at"]} for m in members],
+        }
+
+    def list_groups(self):
+        user = self.require_auth()
+        if user is None:
+            return
+        with db_lock:
+            rows = DB.execute(
+                "SELECT group_id FROM group_members WHERE user_id = ? ORDER BY joined_at DESC", (user["id"],)
+            ).fetchall()
+            groups = [self._group_payload(row["group_id"], user["id"]) for row in rows]
+        self.send_json(200, {"groups": [group for group in groups if group is not None]})
+
+    def get_group(self, group_id_raw):
+        user = self.require_auth()
+        if user is None:
+            return
+        try:
+            group_id = int(group_id_raw)
+        except (ValueError, TypeError):
+            return self.fail(400, "Некоректний ID групи")
+        with db_lock:
+            group = self._group_payload(group_id, user["id"])
+        if group is None:
+            return self.fail(404, "Групу не знайдено або в тебе немає доступу")
+        self.send_json(200, {"group": group})
+
+    def create_group(self):
+        user = self.require_auth()
+        if user is None:
+            return
+        data = self.read_json()
+        if data is None:
+            return
+        name = clean(data.get("name"), 50).strip()
+        description = clean(data.get("description"), 600).strip()
+        if len(name) < 2:
+            return self.fail(400, "Назва групи має містити щонайменше 2 символи")
+        now = int(time.time())
+        code = secrets.token_hex(6)
+        with db_lock:
+            cur = DB.execute(
+                "INSERT INTO chat_groups (name, description, invite_code, owner_id, created_at) VALUES (?,?,?,?,?)",
+                (name, description, code, user["id"], now),
+            )
+            group_id = cur.lastrowid
+            DB.execute(
+                "INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?,?,?,?)",
+                (group_id, user["id"], "owner", now),
+            )
+            DB.commit()
+            group = self._group_payload(group_id, user["id"])
+        self.send_json(201, {"group": group})
+
+    def join_group(self):
+        user = self.require_auth()
+        if user is None:
+            return
+        data = self.read_json()
+        if data is None:
+            return
+        code = clean(data.get("invite_code"), 32).strip().lower()
+        now = int(time.time())
+        with db_lock:
+            group = DB.execute("SELECT id FROM chat_groups WHERE invite_code = ?", (code,)).fetchone()
+            if group is None:
+                return self.fail(404, "Посилання-запрошення не знайдено")
+            count = DB.execute("SELECT COUNT(*) AS n FROM group_members WHERE group_id = ?", (group["id"],)).fetchone()["n"]
+            if count >= 32:
+                return self.fail(409, "У групі вже максимальна кількість учасників")
+            DB.execute(
+                "INSERT OR IGNORE INTO group_members (group_id, user_id, role, joined_at) VALUES (?,?,?,?)",
+                (group["id"], user["id"], "member", now),
+            )
+            DB.commit()
+            result = self._group_payload(group["id"], user["id"])
+        self.send_json(200, {"group": result})
+
+    def _group_id(self, raw):
+        try:
+            return max(0, int(raw))
+        except (ValueError, TypeError):
+            return 0
+
+    def _group_admin(self, group_id, user_id):
+        return DB.execute(
+            "SELECT role FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, user_id)
+        ).fetchone()
+
+    def add_group_member(self, group_id_raw):
+        user = self.require_auth()
+        if user is None:
+            return
+        group_id = self._group_id(group_id_raw)
+        data = self.read_json()
+        if not group_id or data is None:
+            return self.fail(400, "Некоректна група")
+        target = find_user(data.get("nick"))
+        if target is None:
+            return self.fail(404, "Користувача не знайдено")
+        now = int(time.time())
+        with db_lock:
+            mine = self._group_admin(group_id, user["id"])
+            if mine is None or mine["role"] not in ("owner", "moderator"):
+                return self.fail(403, "Додавати учасників можуть лише власник і модератори")
+            count = DB.execute("SELECT COUNT(*) AS n FROM group_members WHERE group_id = ?", (group_id,)).fetchone()["n"]
+            if count >= 32:
+                return self.fail(409, "У групі вже 32 учасники")
+            DB.execute(
+                "INSERT OR IGNORE INTO group_members (group_id, user_id, role, joined_at) VALUES (?,?,?,?)",
+                (group_id, target["id"], "member", now),
+            )
+            DB.commit()
+            result = self._group_payload(group_id, user["id"])
+        self.send_json(200, {"group": result})
+
+    def set_group_member_role(self, group_id_raw):
+        user = self.require_auth()
+        if user is None:
+            return
+        group_id = self._group_id(group_id_raw)
+        data = self.read_json()
+        role = clean(data.get("role"), 20) if isinstance(data, dict) else ""
+        if not group_id or not isinstance(data, dict) or role not in ("moderator", "member"):
+            return self.fail(400, "Некоректна роль учасника")
+        target = find_user(data.get("nick"))
+        if target is None:
+            return self.fail(404, "Користувача не знайдено")
+        with db_lock:
+            mine = self._group_admin(group_id, user["id"])
+            target_member = self._group_admin(group_id, target["id"])
+            if mine is None or mine["role"] != "owner":
+                return self.fail(403, "Керувати ролями може лише власник групи")
+            if target_member is None or target_member["role"] == "owner":
+                return self.fail(400, "Не можна змінити роль цього учасника")
+            DB.execute("UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?", (role, group_id, target["id"]))
+            DB.commit()
+            result = self._group_payload(group_id, user["id"])
+        self.send_json(200, {"group": result})
+
+    def remove_group_member(self, group_id_raw):
+        user = self.require_auth()
+        if user is None:
+            return
+        group_id = self._group_id(group_id_raw)
+        data = self.read_json()
+        if not group_id or data is None:
+            return self.fail(400, "Некоректна група")
+        target = find_user(data.get("nick"))
+        if target is None:
+            return self.fail(404, "Користувача не знайдено")
+        with db_lock:
+            mine = self._group_admin(group_id, user["id"])
+            target_member = self._group_admin(group_id, target["id"])
+            if mine is None or mine["role"] not in ("owner", "moderator"):
+                return self.fail(403, "Видаляти учасників можуть власник і модератори")
+            if target_member is None or target_member["role"] == "owner":
+                return self.fail(400, "Цього учасника не можна видалити")
+            if mine["role"] == "moderator" and target_member["role"] == "moderator":
+                return self.fail(403, "Модератор не може видалити іншого модератора")
+            DB.execute("DELETE FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, target["id"]))
+            DB.commit()
+            result = self._group_payload(group_id, user["id"])
+        self.send_json(200, {"group": result})
+
+    def leave_group(self, group_id_raw):
+        user = self.require_auth()
+        if user is None:
+            return
+        group_id = self._group_id(group_id_raw)
+        with db_lock:
+            mine = self._group_admin(group_id, user["id"])
+            if mine is None:
+                return self.fail(404, "Ти не є учасником цієї групи")
+            if mine["role"] == "owner":
+                return self.fail(409, "Власник має передати роль іншому учаснику перед виходом")
+            DB.execute("DELETE FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, user["id"]))
+            DB.commit()
+        self.send_json(200, {"ok": True})
+
+    def update_group(self, group_id_raw):
+        user = self.require_auth()
+        if user is None:
+            return
+        group_id = self._group_id(group_id_raw)
+        data = self.read_json()
+        if not group_id or data is None:
+            return self.fail(400, "Некоректна група")
+        name = clean(data.get("name"), 50).strip()
+        description = clean(data.get("description"), 600).strip()
+        if len(name) < 2:
+            return self.fail(400, "Назва має містити щонайменше 2 символи")
+        with db_lock:
+            mine = self._group_admin(group_id, user["id"])
+            if mine is None or mine["role"] not in ("owner", "moderator"):
+                return self.fail(403, "Змінювати групу можуть власник і модератори")
+            DB.execute("UPDATE chat_groups SET name = ?, description = ? WHERE id = ?", (name, description, group_id))
+            DB.commit()
+            result = self._group_payload(group_id, user["id"])
+        self.send_json(200, {"group": result})
+
+    def send_group_message(self, group_id_raw):
+        user = self.require_auth()
+        if user is None:
+            return
+        group_id = self._group_id(group_id_raw)
+        data = self.read_json()
+        envelopes = data.get("ciphertexts") if isinstance(data, dict) else None
+        if not group_id or not isinstance(envelopes, dict) or not envelopes:
+            return self.fail(400, "Немає зашифрованого повідомлення")
+        if len(json.dumps(envelopes, separators=(",", ":"))) > 150 * 1024:
+            return self.fail(413, "Зашифроване повідомлення завелике")
+        if any(not isinstance(value, str) or not value.startswith("UKRA1:") for value in envelopes.values()):
+            return self.fail(400, "Усі копії повідомлення мають бути зашифровані")
+        now = int(time.time())
+        stamps = [stamp for stamp in rate.get(user["id"], []) if now - stamp < 60]
+        if len(stamps) >= RATE_LIMIT:
+            return self.fail(429, "Забагато повідомлень, зачекай хвилину")
+        stamps.append(now)
+        rate[user["id"]] = stamps
+        with db_lock:
+            members = DB.execute(
+                "SELECT u.id, u.nick FROM group_members gm JOIN users u ON u.id = gm.user_id WHERE gm.group_id = ?",
+                (group_id,),
+            ).fetchall()
+            if not any(member["id"] == user["id"] for member in members):
+                return self.fail(403, "Ти більше не є учасником цієї групи")
+            expected = {member["nick"] for member in members}
+            if set(envelopes.keys()) != expected:
+                return self.fail(400, "Зашифровані копії не відповідають списку учасників")
+            cur = DB.execute(
+                "INSERT INTO group_messages (group_id, from_id, ciphertexts, ts) VALUES (?,?,?,?)",
+                (group_id, user["id"], json.dumps(envelopes, separators=(",", ":")), now),
+            )
+            event = DB.execute("INSERT INTO message_events (group_message_id) VALUES (?)", (cur.lastrowid,))
+            DB.commit()
+            message_id = event.lastrowid
+        self.send_json(201, {"id": message_id, "ts": now})
 
     # ==================== UKRA MARKET ОБРОБНИКИ ====================
+
+    def get_missions(self, query):
+        locality_id = clean(query.get("locality_id", [""])[0], 50)
+        if not locality_id:
+            return self.send_json(200, {"missions": [], "total": 0})
+        user = self.auth()
+        if user and clean(user["locality_id"], 50) != locality_id:
+            return self.send_json(200, {"missions": [], "total": 0})
+        with db_lock:
+            rows = DB.execute(
+                """SELECT m.*, u.nick AS author_nick, u.name AS author_name,
+                          (SELECT COUNT(*) FROM mission_participants mp WHERE mp.mission_id=m.id) AS participant_count,
+                          (SELECT COUNT(*) FROM mission_participants mp WHERE mp.mission_id=m.id AND mp.user_id=?) AS joined
+                   FROM missions m JOIN users u ON u.id=m.user_id
+                   WHERE m.locality_id=? AND m.status != 'Скасовано'
+                     AND (? IS NULL OR m.user_id NOT IN (SELECT blocked_id FROM blocked_users WHERE user_id=?))
+                   ORDER BY m.created_at DESC LIMIT 100""",
+                (user["id"] if user else 0, locality_id, user["id"] if user else None, user["id"] if user else 0),
+            ).fetchall()
+            missions = []
+            for row in rows:
+                missions.append({
+                    "id": row["id"], "server_id": row["id"], "author_nick": row["author_nick"],
+                    "author": row["author_name"] or row["author_nick"], "locality_id": row["locality_id"],
+                    "city": row["city"], "oblast": row["oblast"], "title": row["title"],
+                    "description": row["description"], "category": row["category"],
+                    "district": row["district"], "schedule": row["schedule"], "target": row["target"],
+                    "status": row["status"], "participant_count": row["participant_count"],
+                    "joined": bool(row["joined"]), "is_owner": bool(user and row["user_id"] == user["id"]),
+                    "created_at": row["created_at"],
+                })
+        self.send_json(200, {"missions": missions, "total": len(missions)})
+
+    def create_mission(self):
+        user = self.require_auth()
+        data = self.read_json()
+        if data is None:
+            return
+        title = clean(data.get("title"), 100)
+        description = clean(data.get("description"), 1800)
+        category = clean(data.get("category"), 40)
+        locality_id = clean(user["locality_id"], 50)
+        district = clean(data.get("district"), 80)
+        schedule = clean(data.get("schedule"), 100)
+        try:
+            target = max(1, min(100, int(data.get("target", 1))))
+        except (TypeError, ValueError):
+            target = 1
+        allowed = {"Взаємодопомога", "Благоустрій", "Тварини", "Подія", "Збір речей", "Інше"}
+        if len(title) < 3 or len(description) < 10 or not locality_id or clean(data.get("locality_id"), 50) != locality_id or category not in allowed:
+            return self.fail(400, "Перевір назву, опис, категорію та населений пункт")
+        status = "Шукаємо учасників"
+        now = int(time.time())
+        with db_lock:
+            recent_count = DB.execute("SELECT COUNT(*) FROM missions WHERE user_id=? AND created_at>?", (user["id"], now - 86400)).fetchone()[0]
+            if recent_count >= 5:
+                return self.fail(429, "За добу можна створити не більше п’яти місій")
+            cur = DB.execute(
+                """INSERT INTO missions (user_id,author_nick,author_name,locality_id,city,oblast,title,description,category,district,schedule,target,status,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (user["id"], user["nick"], clean(user["name"] or user["nick"], 60), locality_id,
+                 clean(user["city"], 60), clean(user["oblast"], 60), title, description,
+                 category, district, schedule, target, status, now, now),
+            )
+            mission_id = cur.lastrowid
+            DB.commit()
+        self.send_json(201, {"ok": True, "mission": {"id": mission_id, "server_id": mission_id, "author": user["name"] or user["nick"], "author_nick": user["nick"], "locality_id": locality_id, "city": user["city"], "oblast": user["oblast"], "title": title, "description": description, "text": description, "category": category, "district": district, "schedule": schedule, "target": target, "status": status, "participant_count": 0, "joined": False, "is_owner": True, "created_at": now}})
+
+    def join_mission(self, mission_id):
+        user = self.require_auth()
+        try:
+            mission_id = int(mission_id)
+        except ValueError:
+            return self.fail(400, "Некоректна місія")
+        with db_lock:
+            mission = DB.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
+            if mission is None or mission["status"] in ("Завершено", "Скасовано"):
+                return self.fail(404, "Місія вже недоступна")
+            if mission["user_id"] == user["id"]:
+                return self.fail(400, "Організатор не може долучитися до власної місії")
+            blocked = DB.execute("SELECT 1 FROM blocked_users WHERE user_id=? AND blocked_id=?", (user["id"], mission["user_id"])).fetchone()
+            if blocked:
+                return self.fail(403, "Дія недоступна")
+            exists = DB.execute("SELECT 1 FROM mission_participants WHERE mission_id=? AND user_id=?", (mission_id, user["id"])).fetchone()
+            if exists:
+                DB.execute("DELETE FROM mission_participants WHERE mission_id=? AND user_id=?", (mission_id, user["id"]))
+                joined = False
+            else:
+                DB.execute("INSERT INTO mission_participants(mission_id,user_id,joined_at) VALUES(?,?,?)", (mission_id, user["id"], int(time.time())))
+                joined = True
+            DB.commit()
+            count = DB.execute("SELECT COUNT(*) FROM mission_participants WHERE mission_id=?", (mission_id,)).fetchone()[0]
+        self.send_json(200, {"ok": True, "joined": joined, "participant_count": count})
+
+    def update_mission_status(self, mission_id):
+        user = self.require_auth()
+        try:
+            mission_id = int(mission_id)
+        except ValueError:
+            return self.fail(400, "Некоректна місія")
+        data = self.read_json()
+        if data is None:
+            return
+        status = clean(data.get("status"), 40)
+        if status not in {"Шукаємо учасників", "У процесі", "Завершено", "Скасовано"}:
+            return self.fail(400, "Некоректний статус")
+        with db_lock:
+            cur = DB.execute("UPDATE missions SET status=?, updated_at=? WHERE id=? AND user_id=?", (status, int(time.time()), mission_id, user["id"]))
+            if cur.rowcount == 0:
+                return self.fail(404, "Місію не знайдено або немає прав")
+            DB.commit()
+        self.send_json(200, {"ok": True, "status": status})
+
+    def report_mission(self, mission_id):
+        user = self.require_auth()
+        try:
+            mission_id = int(mission_id)
+        except ValueError:
+            return self.fail(400, "Некоректна місія")
+        data = self.read_json()
+        if data is None:
+            return
+        reason = clean(data.get("reason"), 60)
+        details = clean(data.get("details"), 500)
+        if reason not in {"Спам", "Шахрайство", "Небезпечний вміст", "Неправдива інформація", "Інше"}:
+            return self.fail(400, "Обери причину скарги")
+        with db_lock:
+            if DB.execute("SELECT 1 FROM missions WHERE id=?", (mission_id,)).fetchone() is None:
+                return self.fail(404, "Місію не знайдено")
+            recent = DB.execute("SELECT 1 FROM mission_reports WHERE reporter_id=? AND mission_id=? AND created_at>?", (user["id"], mission_id, int(time.time()) - 3600)).fetchone()
+            if recent:
+                return self.fail(429, "Ти вже поскаржився на цю місію")
+            DB.execute("INSERT INTO mission_reports(reporter_id,mission_id,reason,details,created_at) VALUES(?,?,?,?,?)", (user["id"], mission_id, reason, details, int(time.time())))
+            DB.commit()
+        self.send_json(201, {"ok": True})
 
     def get_market_items(self, query):
         locality_id = clean(query.get("locality_id", [""])[0], 50)
