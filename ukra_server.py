@@ -155,6 +155,25 @@ def init_db(path):
         );
         CREATE INDEX IF NOT EXISTS idx_mission_reports_mission ON mission_reports(mission_id, created_at);
 
+        CREATE TABLE IF NOT EXISTS map_places (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            author_nick TEXT NOT NULL,
+            author_name TEXT NOT NULL,
+            locality_id TEXT NOT NULL,
+            city TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL,
+            lat REAL NOT NULL,
+            lon REAL NOT NULL,
+            photo BLOB,
+            photo_v INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_map_places_locality ON map_places(locality_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_map_places_user ON map_places(user_id, created_at);
+
         CREATE TABLE IF NOT EXISTS market_favorites (
             user_id INTEGER NOT NULL,
             item_id INTEGER NOT NULL,
@@ -374,6 +393,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.get_messages(query.get("since", ["0"])[0])
         if parts == ["api", "missions"]:
             return self.get_missions(query)
+        if parts == ["api", "map", "places"]:
+            return self.get_map_places()
+        if len(parts) == 5 and parts[:3] == ["api", "map", "places"] and parts[4] == "photo":
+            return self.get_map_place_photo(parts[3])
         if parts == ["api", "groups"]:
             return self.list_groups()
         if len(parts) == 3 and parts[:2] == ["api", "groups"]:
@@ -409,6 +432,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_message()
         if parts == ["api", "missions"]:
             return self.create_mission()
+        if parts == ["api", "map", "places"]:
+            return self.create_map_place()
+        if len(parts) == 5 and parts[:3] == ["api", "map", "places"] and parts[4] == "photo":
+            return self.upload_map_place_photo(parts[3])
         if len(parts) == 4 and parts[:2] == ["api", "missions"]:
             if parts[3] == "join":
                 return self.join_mission(parts[2])
@@ -936,6 +963,116 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(201, {"id": message_id, "ts": now})
 
     # ==================== UKRA MARKET ОБРОБНИКИ ====================
+
+    def get_map_places(self):
+        user = self.require_auth()
+        locality_id = clean(user["locality_id"], 50)
+        if not locality_id:
+            return self.send_json(200, {"places": [], "total": 0})
+        with db_lock:
+            rows = DB.execute(
+                """SELECT p.*, u.nick AS current_nick FROM map_places p
+                   JOIN users u ON u.id=p.user_id
+                   WHERE p.locality_id=?
+                     AND p.user_id NOT IN (SELECT blocked_id FROM blocked_users WHERE user_id=?)
+                   ORDER BY p.created_at DESC LIMIT 300""",
+                (locality_id, user["id"]),
+            ).fetchall()
+        places = [{
+            "id": int(row["id"]), "name": row["name"], "description": row["description"],
+            "category": row["category"], "lat": row["lat"], "lon": row["lon"],
+            "locality_id": row["locality_id"], "city": row["city"],
+            "author": row["author_name"], "author_nick": row["author_nick"],
+            "has_photo": row["photo"] is not None, "photo_v": row["photo_v"], "created_at": row["created_at"],
+        } for row in rows]
+        self.send_json(200, {"places": places, "total": len(places)})
+
+    def create_map_place(self):
+        user = self.require_auth()
+        data = self.read_json()
+        if data is None:
+            return
+        name = clean(data.get("name"), 80)
+        description = clean(data.get("description"), 600)
+        category = clean(data.get("category"), 30)
+        locality_id = clean(user["locality_id"], 50)
+        allowed = {"shop", "food", "pharmacy", "service", "public"}
+        letters_name = re.findall(r"[^\W\d_]", name, flags=re.UNICODE)
+        letters_desc = re.findall(r"[^\W\d_]", description, flags=re.UNICODE)
+        vowels = set("аеиіоуяєюїыэёaeiouy")
+        vowel_count = sum(1 for char in letters_desc if char.casefold() in vowels)
+        if (not locality_id or len(name) < 3 or len(letters_name) < 3
+                or len(set(c.casefold() for c in letters_name)) < 2
+                or len(description) < 20 or len(description.split()) < 4 or len(letters_desc) < 12 or vowel_count < 3
+                or len(set(c.casefold() for c in letters_desc)) < 5
+                or category not in allowed):
+            return self.fail(400, "Додай справжню назву й опис щонайменше з чотирьох слів, обери категорію та населений пункт у профілі")
+        try:
+            lat, lon = float(data.get("lat")), float(data.get("lon"))
+        except (TypeError, ValueError):
+            return self.fail(400, "Не вдалося визначити точку на мапі")
+        if not (43.0 <= lat <= 53.0 and 21.0 <= lon <= 41.0):
+            return self.fail(400, "Точка має бути в межах України")
+        now = int(time.time())
+        normalized = " ".join(name.casefold().split())
+        with db_lock:
+            recent = DB.execute("SELECT COUNT(*) FROM map_places WHERE user_id=? AND created_at>?", (user["id"], now - 86400)).fetchone()[0]
+            if recent >= 3:
+                return self.fail(429, "За добу можна додати не більше трьох місць")
+            recent_names = DB.execute("SELECT name FROM map_places WHERE locality_id=? AND created_at>?", (locality_id, now - 30 * 86400)).fetchall()
+            if any(" ".join(row["name"].casefold().split()) == normalized for row in recent_names):
+                return self.fail(409, "Схоже місце вже додали у твоєму населеному пункті")
+            cur = DB.execute(
+                """INSERT INTO map_places(user_id,author_nick,author_name,locality_id,city,name,description,category,lat,lon,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (user["id"], user["nick"], clean(user["name"] or user["nick"], 60), locality_id,
+                 clean(user["city"], 60), name, description, category, lat, lon, now),
+            )
+            DB.commit()
+            place_id = cur.lastrowid
+        self.send_json(201, {"ok": True, "place": {"id": place_id, "name": name, "description": description,
+            "category": category, "lat": lat, "lon": lon, "locality_id": locality_id,
+            "city": user["city"], "author": user["name"] or user["nick"], "author_nick": user["nick"],
+            "has_photo": False, "created_at": now}})
+
+    def get_map_place_photo(self, place_id):
+        try:
+            place_id = int(place_id)
+        except ValueError:
+            return self.fail(400, "Некоректний ID")
+        user = self.require_auth()
+        with db_lock:
+            row = DB.execute("SELECT photo,locality_id FROM map_places WHERE id=?", (place_id,)).fetchone()
+            if not row or not row["photo"] or row["locality_id"] != clean(user["locality_id"], 50):
+                return self.fail(404, "Фото недоступне")
+            data = bytes(row["photo"])
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def upload_map_place_photo(self, place_id):
+        user = self.require_auth()
+        try:
+            place_id = int(place_id)
+        except ValueError:
+            return self.fail(400, "Некоректний ID")
+        raw = self.read_body(MAX_IMAGE)
+        if raw is None:
+            return self.fail(413, "Фото завелике (максимум 800 КБ)")
+        if not raw.startswith(b"\xff\xd8"):
+            return self.fail(400, "Потрібен файл JPEG")
+        with db_lock:
+            row = DB.execute("SELECT user_id FROM map_places WHERE id=?", (place_id,)).fetchone()
+            if not row:
+                return self.fail(404, "Місце не знайдено")
+            if row["user_id"] != user["id"]:
+                return self.fail(403, "Змінювати фото може лише автор")
+            DB.execute("UPDATE map_places SET photo=?, photo_v=photo_v+1 WHERE id=?", (raw, place_id))
+            DB.commit()
+        self.send_json(200, {"ok": True})
 
     def get_missions(self, query):
         locality_id = clean(query.get("locality_id", [""])[0], 50)
