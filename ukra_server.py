@@ -61,7 +61,7 @@ class PostgresDB:
     SERIAL_TABLES = {"users", "messages", "message_events", "chat_groups", "group_messages", "map_places", "missions", "market_items", "market_offers", "market_reviews", "mission_reports", "market_reports"}
 
     def __init__(self, url):
-        self.connection = psycopg2.connect(url, cursor_factory=DictCursor)
+        self.connection = psycopg2.connect(normalize_database_url(url), cursor_factory=DictCursor)
         self.connection.autocommit = True
 
     def execute(self, sql, params=()):
@@ -93,7 +93,10 @@ class PostgresDB:
             statement = re.sub(r"\bBLOB\b", "BYTEA", statement, flags=re.I)
             statement = re.sub(r"INSERT OR IGNORE INTO", "INSERT INTO", statement, flags=re.I)
             if statement.upper().startswith("INSERT INTO"):
-                statement = re.sub(r"\s+ORDER BY\s+[^;]+$", "", statement, flags=re.I)
+                if re.search(r"\bSELECT\b", statement, flags=re.I):
+                    statement = re.sub(r"\s+ORDER BY\s+[^;]+$", "", statement, flags=re.I)
+                    if not re.search(r"\bWHERE\b", statement, flags=re.I):
+                        statement += " WHERE TRUE"
                 statement += " ON CONFLICT DO NOTHING"
             with self.connection.cursor() as cursor:
                 cursor.execute(statement)
@@ -103,6 +106,20 @@ class PostgresDB:
 
     def close(self):
         self.connection.close()
+
+
+def normalize_database_url(value):
+    """Accept Neon URI copied from its dashboard, even with shell wrappers or # in password."""
+    value = str(value or "").strip().strip("\"'")
+    if value.lower().startswith("psql "):
+        match = re.search(r"postgres(?:ql)?://[^\s\"']+", value, flags=re.I)
+        if match:
+            value = match.group(0)
+    if value.lower().startswith(("postgres://", "postgresql://")):
+        # URI fragments are not valid in connection strings. A literal # is commonly
+        # generated in passwords, so encode it as credential data before libpq parses it.
+        value = value.replace("#", "%23")
+    return value
 
 
 def init_db(path):
