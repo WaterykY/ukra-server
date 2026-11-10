@@ -21,6 +21,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
+try:
+    import psycopg2
+    from psycopg2.extras import DictCursor
+except ImportError:
+    psycopg2 = None
+    DictCursor = None
+
 NICK_RE = re.compile(r"^[a-z0-9_.]{3,20}$")
 MAX_IMAGE = 800 * 1024
 MAX_JSON = 160 * 1024
@@ -32,12 +39,83 @@ db_lock = threading.Lock()
 rate = {}  # user_id -> [timestamps]
 reg_rate = {}  # ip -> [timestamps]
 DB = None
+POSTGRES = False
+
+
+class PostgresCursor:
+    def __init__(self, cursor, lastrowid=None):
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+
+class PostgresDB:
+    SERIAL_TABLES = {"users", "messages", "message_events", "chat_groups", "group_messages", "map_places", "missions", "market_items", "market_offers", "market_reviews", "mission_reports", "market_reports"}
+
+    def __init__(self, url):
+        self.connection = psycopg2.connect(url, cursor_factory=DictCursor)
+        self.connection.autocommit = True
+
+    def execute(self, sql, params=()):
+        query = sql.replace("?", "%s")
+        ignored = bool(re.search(r"INSERT OR IGNORE INTO", query, flags=re.I))
+        query = re.sub(r"INSERT OR IGNORE INTO", "INSERT INTO", query, flags=re.I)
+        is_insert = bool(re.search(r"INSERT INTO", query, flags=re.I))
+        if ignored:
+            query = query.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        table_match = re.search(r"INSERT INTO\s+([a-z_]+)", query, flags=re.I)
+        serial_insert = bool(table_match and table_match.group(1).lower() in self.SERIAL_TABLES)
+        if serial_insert and not ignored and "RETURNING" not in query.upper():
+            query = query.rstrip().rstrip(";") + " RETURNING id"
+        cursor = self.connection.cursor()
+        cursor.execute(query, params)
+        lastrowid = None
+        if serial_insert and not ignored:
+            inserted = cursor.fetchone()
+            if inserted:
+                lastrowid = inserted["id"]
+        return PostgresCursor(cursor, lastrowid)
+
+    def executescript(self, script):
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if not statement:
+                continue
+            statement = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", statement, flags=re.I)
+            statement = re.sub(r"\bBLOB\b", "BYTEA", statement, flags=re.I)
+            statement = re.sub(r"INSERT OR IGNORE INTO", "INSERT INTO", statement, flags=re.I)
+            if statement.upper().startswith("INSERT INTO"):
+                statement = re.sub(r"\s+ORDER BY\s+[^;]+$", "", statement, flags=re.I)
+                statement += " ON CONFLICT DO NOTHING"
+            with self.connection.cursor() as cursor:
+                cursor.execute(statement)
+
+    def commit(self):
+        return None
+
+    def close(self):
+        self.connection.close()
 
 
 def init_db(path):
-    global DB
-    DB = sqlite3.connect(path, check_same_thread=False)
-    DB.row_factory = sqlite3.Row
+    global DB, POSTGRES
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    POSTGRES = bool(database_url)
+    if POSTGRES:
+        if psycopg2 is None:
+            raise RuntimeError("DATABASE_URL задано, але psycopg2 не встановлено")
+        DB = PostgresDB(database_url)
+    else:
+        DB = sqlite3.connect(path, check_same_thread=False)
+        DB.row_factory = sqlite3.Row
     DB.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -227,20 +305,23 @@ def init_db(path):
         """
     )
     # Migrate existing MVP databases without discarding existing nick accounts.
-    cols = {r[1] for r in DB.execute("PRAGMA table_info(users)").fetchall()}
+    if POSTGRES:
+        cols = {r["column_name"] for r in DB.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='users'").fetchall()}
+    else:
+        cols = {r[1] for r in DB.execute("PRAGMA table_info(users)").fetchall()}
     for name, sql in (("email", "ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''"), ("pass_salt", "ALTER TABLE users ADD COLUMN pass_salt TEXT NOT NULL DEFAULT ''"), ("pass_hash", "ALTER TABLE users ADD COLUMN pass_hash TEXT NOT NULL DEFAULT ''")):
         if name not in cols:
             DB.execute(sql)
     DB.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email != ''")
     try:
         DB.execute("ALTER TABLE map_places ADD COLUMN icon TEXT NOT NULL DEFAULT 'pin'")
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, psycopg2.Error if POSTGRES else sqlite3.OperationalError):
         pass
     DB.commit()
     for column in ("name_lc TEXT DEFAULT ''", "uid INTEGER", "pub TEXT DEFAULT ''"):
         try:
             DB.execute("ALTER TABLE users ADD COLUMN " + column)
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, psycopg2.Error if POSTGRES else sqlite3.OperationalError):
             pass  # колонка вже є
     DB.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_uid ON users(uid)")
     for row in DB.execute("SELECT id FROM users WHERE uid IS NULL").fetchall():
@@ -534,7 +615,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 DB.commit()
                 row = DB.execute("SELECT * FROM users WHERE nick = ?", (nick,)).fetchone()
-        except sqlite3.IntegrityError:
+        except (sqlite3.IntegrityError, psycopg2.IntegrityError if POSTGRES else sqlite3.IntegrityError):
             return self.fail(409, "Цей нікнейм або email уже використовується")
         recent.append(now)
         reg_rate[ip] = recent
