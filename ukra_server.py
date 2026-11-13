@@ -19,7 +19,7 @@ import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, parse_qsl
 
 try:
     import psycopg2
@@ -61,7 +61,7 @@ class PostgresDB:
     SERIAL_TABLES = {"users", "messages", "message_events", "chat_groups", "group_messages", "map_places", "missions", "market_items", "market_offers", "market_reviews", "mission_reports", "market_reports"}
 
     def __init__(self, url):
-        self.connection = psycopg2.connect(normalize_database_url(url), cursor_factory=DictCursor)
+        self.connection = psycopg2.connect(url, cursor_factory=DictCursor)
         self.connection.autocommit = True
 
     def execute(self, sql, params=()):
@@ -109,16 +109,31 @@ class PostgresDB:
 
 
 def normalize_database_url(value):
-    """Accept Neon URI copied from its dashboard, even with shell wrappers or # in password."""
-    value = str(value or "").strip().strip("\"'")
+    """Convert Postgres URLs to psycopg2 keyword arguments, including special chars."""
+    value = str(value or "").strip()
+    if value.lower().startswith("database_url="):
+        value = value.split("=", 1)[1].strip()
+    value = value.strip().strip("\"'")
     if value.lower().startswith("psql "):
         match = re.search(r"postgres(?:ql)?://[^\s\"']+", value, flags=re.I)
         if match:
             value = match.group(0)
     if value.lower().startswith(("postgres://", "postgresql://")):
-        # URI fragments are not valid in connection strings. A literal # is commonly
-        # generated in passwords, so encode it as credential data before libpq parses it.
+        # A literal # in credentials is not a URL fragment. Encode it before parsing.
         value = value.replace("#", "%23")
+        parts = urlparse(value)
+        if not parts.hostname or not parts.path:
+            raise ValueError("DATABASE_URL должен быть полной ссылкой PostgreSQL из Neon")
+        options = dict(parse_qsl(parts.query, keep_blank_values=True))
+        options.update({"host": parts.hostname, "dbname": unquote(parts.path.lstrip("/"))})
+        if parts.port:
+            options["port"] = parts.port
+        if parts.username is not None:
+            options["user"] = unquote(parts.username)
+        if parts.password is not None:
+            options["password"] = unquote(parts.password)
+        return options
+    # Also accept libpq key=value strings; Neon normally supplies a URL.
     return value
 
 
@@ -129,7 +144,7 @@ def init_db(path):
     if POSTGRES:
         if psycopg2 is None:
             raise RuntimeError("DATABASE_URL задано, але psycopg2 не встановлено")
-        DB = PostgresDB(database_url)
+        DB = PostgresDB(normalize_database_url(database_url))
     else:
         DB = sqlite3.connect(path, check_same_thread=False)
         DB.row_factory = sqlite3.Row
